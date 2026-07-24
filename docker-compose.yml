@@ -1,0 +1,92 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/storage
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost,http://localhost:3000}
+    volumes:
+      - media_storage:/data/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build:
+      context: ./backend
+    command: celery -A app.celery_app.celery_app worker --loglevel=INFO --concurrency=${CELERY_CONCURRENCY:-2}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/storage
+    volumes:
+      - media_storage:/data/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+
+  beat:
+    build:
+      context: ./backend
+    command: celery -A app.celery_app.celery_app beat --loglevel=INFO
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /data/storage
+    volumes:
+      - media_storage:/data/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      worker:
+        condition: service_started
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-}
+        NEXT_PUBLIC_WS_BASE: ${NEXT_PUBLIC_WS_BASE:-}
+        NEXT_PUBLIC_CAPTCHA_SITE_KEY: ${NEXT_PUBLIC_CAPTCHA_SITE_KEY:-}
+        NEXT_PUBLIC_CAPTCHA_ENABLED: ${NEXT_PUBLIC_CAPTCHA_ENABLED:-false}
+    restart: unless-stopped
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  redis_data:
+  media_storage:
