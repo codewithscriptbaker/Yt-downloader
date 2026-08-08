@@ -11,12 +11,19 @@ from yt_dlp.utils import DownloadError
 
 from app.celery_app import celery_app
 from app.config import get_settings
-from app.errors import is_transient_error, map_ytdlp_error
+from app.errors import is_permanent_error, is_retryable_with_fallback, map_ytdlp_error
 from app.jobs import delete_job_record, get_job, list_all_job_ids, update_job_fields
 from app.logging_config import log_event, setup_logging
 from app.models import JobStatus
 from app.network import ensure_host_reachable
 from app.storage import get_storage
+from app.ytdlp_support import (
+    DownloadStrategy,
+    apply_common_opts,
+    build_download_strategies,
+    effective_quality,
+    resolve_impersonate_target,
+)
 
 setup_logging(get_settings().log_level)
 logger = logging.getLogger(__name__)
@@ -28,15 +35,6 @@ class JobCancelled(Exception):
 
 class JobTimeout(Exception):
     pass
-
-
-def _impersonate_target() -> str | None:
-    try:
-        import curl_cffi  # noqa: F401
-
-        return "chrome"
-    except ImportError:
-        return None
 
 
 def _is_tiktok(url: str) -> bool:
@@ -107,15 +105,26 @@ def _build_ydl_opts(
     settings,
     quality: str = "best",
     audio_format: str = "m4a",
+    strategy: DownloadStrategy | None = None,
+    impersonate_target=None,
 ) -> dict:
     from app.formats import audio_postprocessors, is_audio_quality, resolve_ydl_format
+
+    strategy = strategy or DownloadStrategy(
+        name="standard",
+        use_impersonate=False,
+        player_clients=("android", "ios", "web"),
+        soft_format=False,
+        message="Fetching media…",
+    )
+    q = effective_quality(quality, strategy)
 
     tiktok = _is_tiktok(url)
     socket_timeout = (
         settings.tiktok_socket_timeout if tiktok else settings.download_socket_timeout
     )
-    fmt = resolve_ydl_format(quality=quality, url=url, is_tiktok=tiktok)
-    audio_only = is_audio_quality(quality)
+    fmt = resolve_ydl_format(quality=q, url=url, is_tiktok=tiktok)
+    audio_only = is_audio_quality(q)
 
     ydl_opts: dict = {
         "outtmpl": str(tmp_dir / "%(title).80B [%(id)s].%(ext)s"),
@@ -130,9 +139,6 @@ def _build_ydl_opts(
         "file_access_retries": 3,
         "max_filesize": settings.max_file_size_mb * 1024 * 1024,
         "match_filter": _duration_filter(settings.max_duration_seconds),
-        "extractor_args": {
-            "youtube": {"player_client": ["android", "ios", "web"]},
-        },
     }
 
     if audio_only:
@@ -140,18 +146,13 @@ def _build_ydl_opts(
     else:
         ydl_opts["merge_output_format"] = "mp4"
 
-    impersonate = _impersonate_target()
-    if impersonate:
-        ydl_opts["impersonate"] = impersonate
-
-    cookies = (settings.ytdlp_cookies_file or "").strip()
-    if cookies:
-        ydl_opts["cookiefile"] = cookies
-
-    proxy = (settings.ytdlp_proxy or "").strip()
-    if proxy:
-        ydl_opts["proxy"] = proxy
-
+    apply_common_opts(
+        ydl_opts,
+        settings=settings,
+        strategy=strategy,
+        impersonate_target=impersonate_target,
+        url=url,
+    )
     return ydl_opts
 
 
@@ -166,13 +167,16 @@ def _run_ytdlp_download(
     storage,
     quality: str = "best",
     audio_format: str = "m4a",
+    strategy: DownloadStrategy | None = None,
+    impersonate_target=None,
 ) -> dict:
+    stage_msg = strategy.message if strategy else "Fetching media info…"
     _set_stage(
         job_id,
         settings,
         status=JobStatus.DOWNLOADING,
         progress=0,
-        message="Fetching media info…",
+        message=stage_msg,
     )
 
     ydl_opts = _build_ydl_opts(
@@ -183,6 +187,8 @@ def _run_ytdlp_download(
         settings=settings,
         quality=quality,
         audio_format=audio_format,
+        strategy=strategy,
+        impersonate_target=impersonate_target,
     )
 
     with YoutubeDL(ydl_opts) as ydl:
@@ -242,6 +248,7 @@ def _run_ytdlp_download(
             duration=duration,
             size_mb=round(size_mb, 2),
             quality=quality,
+            strategy=strategy.name if strategy else "standard",
         )
         return {"job_id": job_id, "status": "done"}
 
@@ -258,12 +265,19 @@ def download_media(self, job_id: str, url: str) -> dict:
     start = time.time()
     tmp_dir = storage.tmp_dir(job_id)
     opaque = uuid.uuid4().hex
-    max_attempts = max(1, settings.download_retry_attempts)
     backoff = max(0.5, settings.download_retry_backoff_seconds)
 
     job_meta = get_job(job_id)
     quality = (job_meta.quality if job_meta else "best") or "best"
     audio_format = (job_meta.audio_format if job_meta else "m4a") or "m4a"
+
+    impersonate_target = resolve_impersonate_target()
+    strategies = build_download_strategies(
+        quality=quality,
+        impersonate_available=impersonate_target is not None,
+    )
+    # Honor configured retry budget, but always cover the strategy ladder.
+    max_attempts = max(len(strategies), max(1, settings.download_retry_attempts))
 
     log_event(
         logger,
@@ -271,6 +285,7 @@ def download_media(self, job_id: str, url: str) -> dict:
         job_id=job_id,
         url_domain=_safe_domain(url),
         quality=quality,
+        strategies=[s.name for s in strategies],
     )
 
     update_job_fields(
@@ -291,13 +306,16 @@ def download_media(self, job_id: str, url: str) -> dict:
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return {"job_id": job_id, "status": "cancelled"}
 
+        strategy = strategies[min(attempt - 1, len(strategies) - 1)]
+        has_next = attempt < max_attempts
+
         if attempt > 1:
             _set_stage(
                 job_id,
                 settings,
                 status=JobStatus.RETRYING,
                 progress=0,
-                message=f"Temporary network issue — retry {attempt}/{max_attempts}…",
+                message=f"Retry {attempt}/{max_attempts}: {strategy.message}",
             )
             log_event(
                 logger,
@@ -305,6 +323,7 @@ def download_media(self, job_id: str, url: str) -> dict:
                 job_id=job_id,
                 attempt=attempt,
                 max_attempts=max_attempts,
+                strategy=strategy.name,
             )
             time.sleep(backoff * (attempt - 1))
             _reset_tmp_dir(tmp_dir)
@@ -321,7 +340,6 @@ def download_media(self, job_id: str, url: str) -> dict:
             ensure_host_reachable(url)
         except Exception as exc:
             last_exc = exc
-            can_retry = attempt < max_attempts
             log_event(
                 logger,
                 "download_dns_wait",
@@ -329,7 +347,7 @@ def download_media(self, job_id: str, url: str) -> dict:
                 attempt=attempt,
                 error=str(exc)[:240],
             )
-            if can_retry:
+            if has_next:
                 _set_stage(
                     job_id,
                     settings,
@@ -364,6 +382,8 @@ def download_media(self, job_id: str, url: str) -> dict:
                 storage=storage,
                 quality=quality,
                 audio_format=audio_format,
+                strategy=strategy,
+                impersonate_target=impersonate_target,
             )
 
         except JobCancelled:
@@ -396,14 +416,38 @@ def download_media(self, job_id: str, url: str) -> dict:
 
         except Exception as exc:
             last_exc = exc
-            can_retry = attempt < max_attempts and is_transient_error(exc)
-            if can_retry:
+            if is_permanent_error(exc):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                msg = map_ytdlp_error(exc)
+                update_job_fields(
+                    job_id,
+                    settings.file_ttl_seconds,
+                    status=JobStatus.FAILED,
+                    error=msg,
+                    message=None,
+                    progress=0,
+                )
                 log_event(
                     logger,
-                    "download_transient_error",
+                    "download_failed_permanent",
+                    job_id=job_id,
+                    error=msg,
+                    attempts=attempt,
+                    strategy=strategy.name,
+                )
+                return {"job_id": job_id, "status": "failed", "error": msg}
+
+            if is_retryable_with_fallback(exc, has_next_strategy=has_next):
+                log_event(
+                    logger,
+                    "download_fallback",
                     job_id=job_id,
                     attempt=attempt,
-                    error=str(exc)[:240],
+                    strategy=strategy.name,
+                    next_strategy=strategies[min(attempt, len(strategies) - 1)].name
+                    if has_next
+                    else None,
+                    error=f"{type(exc).__name__}: {_safe_err(exc)}"[:240],
                 )
                 continue
 
@@ -417,7 +461,14 @@ def download_media(self, job_id: str, url: str) -> dict:
                 message=None,
                 progress=0,
             )
-            log_event(logger, "download_failed", job_id=job_id, error=msg, attempts=attempt)
+            log_event(
+                logger,
+                "download_failed",
+                job_id=job_id,
+                error=msg,
+                attempts=attempt,
+                strategy=strategy.name,
+            )
             return {"job_id": job_id, "status": "failed", "error": msg}
 
     # Defensive fallback — loop should always return above.
@@ -432,6 +483,10 @@ def download_media(self, job_id: str, url: str) -> dict:
         progress=0,
     )
     return {"job_id": job_id, "status": "failed", "error": msg}
+
+
+def _safe_err(exc: BaseException) -> str:
+    return (str(exc) or type(exc).__name__).strip()
 
 
 def _duration_filter(max_seconds: int):

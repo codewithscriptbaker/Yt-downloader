@@ -33,6 +33,8 @@ Test-NetConnection localhost -Port 6379
 redis-cli ping
 ```
 
+
+
 ### One-time setup
 
 ```powershell
@@ -69,6 +71,26 @@ cd C:\Users\User\Desktop\Duktoo\YT\frontend
 npm install
 ```
 
+
+
+### Run everything (one command)
+
+```powershell
+cd C:\Users\User\Desktop\Duktoo\YT
+py scripts\run_all.py
+```
+
+Starts Redis → API (`8009`) → Celery worker → Celery beat → frontend (`3005`), waiting **4 seconds** between each. Press **Ctrl+C** to stop all.
+
+Optional overrides:
+
+```powershell
+$env:DUKTOO_API_PORT="8009"
+$env:DUKTOO_FRONTEND_PORT="3005"
+$env:DUKTOO_START_SLEEP="4"
+py scripts\run_all.py
+```
+
 ### Run (4 terminals)
 
 **Terminal 1 — API (hot reload)**
@@ -80,7 +102,7 @@ $env:PYTHONPATH="."
 $env:REDIS_URL="redis://localhost:6379/0"
 $env:STORAGE_PATH="C:\Users\User\Desktop\Duktoo\YT\data\storage"
 $env:CORS_ORIGINS="http://localhost:3000"
-py -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+py -m uvicorn app.main:app --reload --host 0.0.0.0 --port 8009
 ```
 
 **Terminal 2 — Celery worker**
@@ -114,12 +136,12 @@ cd C:\Users\User\Desktop\Duktoo\YT\frontend
 $env:NEXT_PUBLIC_API_BASE="http://localhost:8000"
 $env:NEXT_PUBLIC_WS_BASE="ws://localhost:8000"
 $env:NEXT_PUBLIC_CAPTCHA_ENABLED="false"
-npm run dev
+npm run dev -- -p 3005
 ```
 
-Open: **http://localhost:3000**
+Open: **[http://localhost:3000](http://localhost:3000)**
 
-API docs: **http://localhost:8000/docs**
+API docs: **[http://localhost:8000/docs](http://localhost:8000/docs)**
 
 ### Local tips
 
@@ -127,6 +149,8 @@ API docs: **http://localhost:8000/docs**
 - Restart worker/beat after changing Celery task code.
 - Without Nginx, always set `NEXT_PUBLIC_API_BASE` and `NEXT_PUBLIC_WS_BASE` as above.
 - If Redis container already exists but is stopped: `docker start yt-redis`
+
+
 
 ### Redis helper commands
 
@@ -146,6 +170,8 @@ docker exec yt-redis redis-cli ping
 Test-NetConnection localhost -Port 6379
 ```
 
+
+
 ### Local unit checks (no Redis needed)
 
 ```powershell
@@ -157,6 +183,8 @@ py tests\test_local.py
 
 ---
 
+
+
 ## Alternative: Docker Compose (full stack)
 
 ```powershell
@@ -166,7 +194,7 @@ copy .env.example .env
 docker compose up --build -d
 ```
 
-Open: **http://localhost**
+Open: **[http://localhost](http://localhost)**
 
 ```powershell
 # Stop
@@ -182,23 +210,31 @@ docker compose up -d backend worker beat
 
 ---
 
+
+
 ## API
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/health` | Health + disk usage |
-| POST | `/api/jobs` | `{ "url", "quality?", "audio_format?", "captcha_token?" }` → `{ "job_id" }` |
-| POST | `/api/preview` | Metadata only: title, thumbnail, duration, size estimate |
-| GET | `/api/jobs/{id}` | Status (polling fallback); includes `error_hint`, `expires_at`, `quality` |
-| GET | `/api/jobs/{id}/download` | Signed download URL |
-| GET | `/api/jobs/{id}/file` | Stream file with token |
-| DELETE | `/api/jobs/{id}` | Cancel own job |
-| WS | `/ws/jobs/{id}` | Live status |
 
-`quality`: `best` · `1080` · `720` · `360` · `audio`  
-`audio_format` (when quality is `audio`): `m4a` · `mp3`
+| Method | Path                      | Purpose                                                                     |
+| ------ | ------------------------- | --------------------------------------------------------------------------- |
+| GET    | `/api/health`             | Health + disk usage                                                         |
+| POST   | `/api/jobs`               | `{ "url", "quality?", "audio_format?", "captcha_token?" }` → `{ "job_id" }` |
+| POST   | `/api/jobs/batch`         | `{ "urls": [...], "quality?", … }` → `{ "job_ids": [...] }` (max 5)         |
+| POST   | `/api/preview`            | Metadata + qualities; playlists return `kind: "playlist"` + `entries`       |
+| GET    | `/api/jobs/{id}`          | Status (polling fallback); includes `error_hint`, `expires_at`, `quality`   |
+| GET    | `/api/jobs/{id}/download` | Signed download URL                                                         |
+| GET    | `/api/jobs/{id}/file`     | Stream file with token                                                      |
+| DELETE | `/api/jobs/{id}`          | Cancel own job                                                              |
+| WS     | `/ws/jobs/{id}`           | Live status                                                                 |
+
+
+`quality`: `best` · `audio` · or a height from preview (`1080`, `720`, …)  
+`audio_format` (when quality is `audio`): `m4a` · `mp3`  
+Playlist URLs (`youtube.com/playlist?list=…`): preview lists up to 30 entries; download at most 5 selected videos as separate jobs. Watch URLs with `&list=` stay single-video.
 
 ---
+
+
 
 ## Public launch checklist
 
@@ -208,6 +244,8 @@ docker compose up -d backend worker beat
 4. Confirm rate limits and disk caps in `.env`
 
 ---
+
+
 
 ## Ops
 

@@ -31,6 +31,8 @@ from app.jobs import (
 from app.logging_config import log_event
 from app.models import (
     ACTIVE_STATUSES,
+    CreateBatchJobRequest,
+    CreateBatchJobResponse,
     CreateJobRequest,
     CreateJobResponse,
     DownloadResponse,
@@ -134,6 +136,93 @@ async def create_download_job(
         quality=body.quality,
     )
     return CreateJobResponse(job_id=record.job_id)
+
+
+@router.post(
+    "/api/jobs/batch",
+    response_model=CreateBatchJobResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_download_jobs_batch(
+    body: CreateBatchJobRequest,
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> CreateBatchJobResponse:
+    """Enqueue one job per URL (playlist multi-select). Same quality for all."""
+    ip = client_ip(request)
+    await verify_captcha(body.captcha_token, ip, settings)
+
+    if is_disk_full(settings):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage is full. Please try again later.",
+        )
+
+    urls = body.urls
+    if len(urls) > settings.max_playlist_select:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Select at most {settings.max_playlist_select} videos at a time.",
+        )
+
+    hourly = get_hourly_submissions(ip)
+    if hourly + len(urls) > settings.max_jobs_per_ip_per_hour:
+        remaining = max(0, settings.max_jobs_per_ip_per_hour - hourly)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Rate limit exceeded: {remaining} job(s) left this hour "
+                f"(max {settings.max_jobs_per_ip_per_hour}/hour)."
+            ),
+        )
+
+    active = count_active_jobs_for_ip(ip)
+    # Allow playlist batches up to max_playlist_select concurrent for this IP
+    active_cap = max(settings.max_jobs_per_ip, settings.max_playlist_select)
+    if active + len(urls) > active_cap:
+        free = max(0, active_cap - active)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(
+                f"Too many active jobs. You can start {free} more "
+                f"(max {active_cap} at a time)."
+            ),
+        )
+
+    validated: list[tuple[str, str]] = []
+    for raw in urls:
+        validated.append(validate_media_url(raw, settings))
+
+    audio_format = body.audio_format if body.quality == "audio" else "m4a"
+    from app.tasks import download_media
+
+    job_ids: list[str] = []
+    for url, domain in validated:
+        record = create_job(
+            url,
+            domain,
+            ip,
+            settings.file_ttl_seconds,
+            quality=body.quality,
+            audio_format=audio_format,
+        )
+        increment_hourly_submissions(ip, settings.max_jobs_per_ip_per_hour)
+        async_result = download_media.delay(record.job_id, url)
+        record.celery_task_id = async_result.id
+        save_job(record, settings.file_ttl_seconds)
+        job_ids.append(record.job_id)
+        log_event(
+            logger,
+            "job_created",
+            job_id=record.job_id,
+            url_domain=domain,
+            ip=ip,
+            quality=body.quality,
+            batch=True,
+        )
+
+    log_event(logger, "job_batch_created", ip=ip, count=len(job_ids), quality=body.quality)
+    return CreateBatchJobResponse(job_ids=job_ids)
 
 
 @router.post("/api/preview", response_model=PreviewResponse)

@@ -4,8 +4,8 @@ celery[redis]==5.4.0
 redis==5.2.1
 pydantic==2.10.4
 pydantic-settings==2.10.1
-yt-dlp==2026.7.4
-curl_cffi>=0.7.0
+yt-dlp>=2026.7.4
+curl_cffi>=0.7.0,<0.16
 httpx==0.28.1
 python-multipart==0.0.20
 websockets==15.0.1

@@ -20,6 +20,14 @@ ERROR_MAP = [
     (re.compile(r"unsupported url|no suitable extractor", re.I), "This link isn’t from a supported site."),
     (
         re.compile(
+            r"unable to extract universal data|unable to extract webpage video data|"
+            r"unexpected response from webpage|rehydration",
+            re.I,
+        ),
+        "TikTok blocked this preview. Try again in a moment, or paste a different public link.",
+    ),
+    (
+        re.compile(
             r"getaddrinfo failed|name or service not known|nodename nor servname|"
             r"temporary failure in name resolution|dns|failed to resolve|"
             r"could not resolve host|curl:\s*\(6\)|"
@@ -44,6 +52,7 @@ ERROR_HINTS = [
     (re.compile(r"rate-limiting|try again later", re.I), "Wait a few minutes, then retry the same link."),
     (re.compile(r"duration limit|longer than", re.I), "Pick a shorter video under the duration cap."),
     (re.compile(r"supported site", re.I), "Use a YouTube, TikTok, or Instagram link."),
+    (re.compile(r"TikTok blocked|rehydration", re.I), "Open the clip in a browser to confirm it’s public, then paste the link again."),
     (re.compile(r"Couldn't reach the site", re.I), "Check your connection, then tap Retry."),
 ]
 
@@ -67,16 +76,29 @@ TRANSIENT_PATTERNS = [
     re.compile(r"temporary failure|try again later", re.I),
 ]
 
-# Permanent failures — never retry these.
+# Permanent failures — never retry / never advance fallback ladder.
 PERMANENT_PATTERNS = [
     re.compile(r"private video|login required|sign in", re.I),
     re.compile(r"geo.?restrict|not available in your country|blocked in your country", re.I),
     re.compile(r"video unavailable|has been removed|uploader has closed", re.I),
-    re.compile(r"no video formats|requested format is not available", re.I),
     re.compile(r"copyright|dmca", re.I),
     re.compile(r"file is larger|max.?filesize|too large", re.I),
     re.compile(r"longer than .+ minutes is not allowed", re.I),
     re.compile(r"unsupported url|no suitable extractor", re.I),
+]
+
+# Format issues may succeed on a softer strategy — not hard-permanent for the ladder.
+FORMAT_FALLBACK_PATTERNS = [
+    re.compile(r"no video formats|requested format is not available", re.I),
+    re.compile(r"format is not available", re.I),
+]
+
+# Client / extractor setup failures that should advance the fallback ladder.
+SETUP_FALLBACK_PATTERNS = [
+    re.compile(r"assertionerror", re.I),
+    re.compile(r"impersonate", re.I),
+    re.compile(r"curl_cffi", re.I),
+    re.compile(r"impersonate.?target", re.I),
 ]
 
 
@@ -88,7 +110,22 @@ def _message_of(exc: Union[BaseException, str]) -> str:
 
 def is_permanent_error(exc: Union[BaseException, str]) -> bool:
     message = _message_of(exc)
+    if any(p.search(message) for p in FORMAT_FALLBACK_PATTERNS):
+        return False
     return any(p.search(message) for p in PERMANENT_PATTERNS)
+
+
+def is_setup_fallback_error(exc: Union[BaseException, str]) -> bool:
+    """True for client/impersonate/setup failures that another strategy may fix."""
+    if isinstance(exc, BaseException) and type(exc).__name__ == "AssertionError":
+        return True
+    message = _message_of(exc)
+    return any(p.search(message) for p in SETUP_FALLBACK_PATTERNS)
+
+
+def is_format_fallback_error(exc: Union[BaseException, str]) -> bool:
+    message = _message_of(exc)
+    return any(p.search(message) for p in FORMAT_FALLBACK_PATTERNS)
 
 
 def is_transient_error(exc: Union[BaseException, str]) -> bool:
@@ -118,8 +155,35 @@ def is_transient_error(exc: Union[BaseException, str]) -> bool:
     return any(p.search(message) for p in TRANSIENT_PATTERNS)
 
 
+def is_retryable_with_fallback(
+    exc: Union[BaseException, str],
+    *,
+    has_next_strategy: bool,
+) -> bool:
+    """
+    Whether the download loop should advance to the next fallback strategy.
+
+    Permanent content errors never retry. Transient / setup / format issues do
+    when another strategy remains.
+    """
+    if is_permanent_error(exc):
+        return False
+    if not has_next_strategy:
+        return False
+    if is_transient_error(exc):
+        return True
+    if is_setup_fallback_error(exc):
+        return True
+    if is_format_fallback_error(exc):
+        return True
+    # Unknown errors: still try remaining strategies once (production resilience).
+    return True
+
+
 def map_ytdlp_error(exc: BaseException) -> str:
     message = _message_of(exc)
+    if isinstance(exc, AssertionError) or message.lower() == "assertionerror":
+        return "Download client setup failed. Retrying with a different method usually helps."
     for pattern, friendly in ERROR_MAP:
         if pattern.search(message):
             return friendly
@@ -134,6 +198,8 @@ def hint_for_error(friendly_or_raw: str | None) -> str | None:
     """Return a short next-step hint for a user-facing error message."""
     if not friendly_or_raw:
         return None
+    if "client setup failed" in friendly_or_raw.lower():
+        return "Tap Retry — the next attempt uses a safer download method."
     for pattern, hint in ERROR_HINTS:
         if pattern.search(friendly_or_raw):
             return hint
