@@ -3,7 +3,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.formats import normalize_quality
+from app.formats import normalize_quality, quality_is_allowed
 
 
 class JobStatus(str, Enum):
@@ -37,9 +37,9 @@ class CreateJobRequest(BaseModel):
     @classmethod
     def _quality_ok(cls, value: str) -> str:
         q = normalize_quality(value)
-        if q in ("best", "audio") or q.isdigit():
-            return q
-        raise ValueError("quality must be best, audio, or a height like 720")
+        if not quality_is_allowed(q):
+            raise ValueError("quality must be best, audio, or a height like 720 / 1080p60")
+        return q
 
 
 class CreateJobResponse(BaseModel):
@@ -56,9 +56,9 @@ class CreateBatchJobRequest(BaseModel):
     @classmethod
     def _quality_ok(cls, value: str) -> str:
         q = normalize_quality(value)
-        if q in ("best", "audio") or q.isdigit():
-            return q
-        raise ValueError("quality must be best, audio, or a height like 720")
+        if not quality_is_allowed(q):
+            raise ValueError("quality must be best, audio, or a height like 720 / 1080p60")
+        return q
 
     @field_validator("urls")
     @classmethod
@@ -134,6 +134,9 @@ class JobStatusResponse(BaseModel):
     expires_at: Optional[float] = None
     quality: Optional[str] = None
     audio_format: Optional[str] = None
+    file_name: Optional[str] = None
+    file_size_mb: Optional[float] = None
+    queue_position: Optional[int] = None
 
 
 class DownloadResponse(BaseModel):
@@ -146,6 +149,11 @@ class HealthResponse(BaseModel):
     redis: str
     disk_usage_mb: float
     disk_limit_mb: int
+    impersonate_available: bool = False
+    cookies_configured: bool = False
+    cookies_readable: bool = False
+    facebook_ready: bool = False
+    warnings: list[str] = []
 
 
 class JobRecord(BaseModel):
@@ -160,6 +168,7 @@ class JobRecord(BaseModel):
     expires_at: Optional[float] = None
     file_path: Optional[str] = None
     file_name: Optional[str] = None
+    file_size_mb: Optional[float] = None
     opaque_token: Optional[str] = None
     ip: str
     celery_task_id: Optional[str] = None

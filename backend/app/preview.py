@@ -13,7 +13,11 @@ from app.config import Settings
 from app.errors import is_permanent_error, map_ytdlp_error
 from app.formats import summarize_available_qualities
 from app.models import AvailableQuality, PlaylistEntry, PreviewResponse
-from app.ytdlp_support import apply_common_opts, resolve_impersonate_target
+from app.ytdlp_support import (
+    apply_common_opts,
+    is_facebook_url,
+    resolve_impersonate_target,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,20 +81,31 @@ def _estimate_size_mb(info: dict[str, Any]) -> Optional[float]:
     return None
 
 
-def _base_ydl_opts(settings: Settings, *, use_impersonate: bool) -> dict[str, Any]:
+def _base_ydl_opts(
+    settings: Settings, *, use_impersonate: bool, url: str | None = None
+) -> dict[str, Any]:
+    # No format filter — we need the full formats[] list for quality picker.
+    facebook = bool(url and is_facebook_url(url))
+    socket_timeout = (
+        getattr(settings, "facebook_socket_timeout", 60)
+        if facebook
+        else settings.download_socket_timeout
+    )
     ydl_opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
-        "socket_timeout": settings.download_socket_timeout,
-        "format": "best*",
+        "socket_timeout": socket_timeout,
     }
+    if facebook:
+        ydl_opts["retries"] = 10
     target = resolve_impersonate_target() if use_impersonate else None
     apply_common_opts(
         ydl_opts,
         settings=settings,
         impersonate_target=target if use_impersonate else None,
         player_clients=(),
+        url=url,
     )
     if not use_impersonate:
         ydl_opts.pop("impersonate", None)
@@ -98,7 +113,7 @@ def _base_ydl_opts(settings: Settings, *, use_impersonate: bool) -> dict[str, An
 
 
 def _extract_info(url: str, settings: Settings, *, use_impersonate: bool) -> dict[str, Any]:
-    ydl_opts = _base_ydl_opts(settings, use_impersonate=use_impersonate)
+    ydl_opts = _base_ydl_opts(settings, use_impersonate=use_impersonate, url=url)
     ydl_opts["noplaylist"] = True
 
     with YoutubeDL(ydl_opts) as ydl:
@@ -113,7 +128,7 @@ def _extract_info(url: str, settings: Settings, *, use_impersonate: bool) -> dic
 def _extract_playlist_info(
     url: str, settings: Settings, *, use_impersonate: bool
 ) -> dict[str, Any]:
-    ydl_opts = _base_ydl_opts(settings, use_impersonate=use_impersonate)
+    ydl_opts = _base_ydl_opts(settings, use_impersonate=use_impersonate, url=url)
     ydl_opts["noplaylist"] = False
     ydl_opts["extract_flat"] = "in_playlist"
     ydl_opts["playlistend"] = settings.max_playlist_entries
@@ -272,7 +287,13 @@ def _try_first_entry_qualities(
 
 def _with_retries(extract_fn, url: str, settings: Settings) -> dict[str, Any]:
     last_exc: BaseException | None = None
-    attempts = (True, False) if resolve_impersonate_target() is not None else (False,)
+    # Facebook needs impersonate first when available (fingerprint / parse failures).
+    if is_facebook_url(url) and resolve_impersonate_target() is not None:
+        attempts = (True, False)
+    elif resolve_impersonate_target() is not None:
+        attempts = (True, False)
+    else:
+        attempts = (False,)
     for use_impersonate in attempts:
         try:
             return extract_fn(url, settings, use_impersonate=use_impersonate)

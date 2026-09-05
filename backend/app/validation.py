@@ -5,6 +5,19 @@ from fastapi import HTTPException, status
 from app.config import Settings
 
 
+def _host_allowed(host: str, allowed: set[str]) -> bool:
+    """Exact match or subdomain of an allow-listed root (e.g. m.facebook.com)."""
+    host = (host or "").lower().rstrip(".")
+    if not host:
+        return False
+    if host in allowed:
+        return True
+    for domain in allowed:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
+
 def validate_media_url(url: str, settings: Settings) -> tuple[str, str]:
     """Validate URL format and domain allow-list. Returns (normalized_url, domain)."""
     raw = (url or "").strip()
@@ -25,13 +38,10 @@ def validate_media_url(url: str, settings: Settings) -> tuple[str, str]:
     if not host:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid URL host")
 
-    # Strip leading www. for matching, but also check exact host
-    allowed = settings.allowed_domain_set
-    if host not in allowed:
-        # Allow subdomain matches for listed roots (e.g. m.youtube.com already listed)
+    if not _host_allowed(host, settings.allowed_domain_set):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported site. Allowed: YouTube, TikTok, Instagram.",
+            detail="Unsupported site. Allowed: YouTube, TikTok, Instagram, Facebook.",
         )
 
     return raw, host

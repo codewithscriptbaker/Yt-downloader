@@ -22,6 +22,7 @@ from app.ytdlp_support import (
     apply_common_opts,
     build_download_strategies,
     effective_quality,
+    is_facebook_url,
     resolve_impersonate_target,
 )
 
@@ -42,15 +43,48 @@ def _is_tiktok(url: str) -> bool:
     return "tiktok.com" in host
 
 
+def _is_facebook(url: str) -> bool:
+    return is_facebook_url(url)
+
+
+def _socket_timeout_for(url: str, settings) -> int:
+    if _is_tiktok(url):
+        return settings.tiktok_socket_timeout
+    if _is_facebook(url):
+        return getattr(settings, "facebook_socket_timeout", 60)
+    return settings.download_socket_timeout
+
+
+def _needs_extra_retries(url: str) -> bool:
+    return _is_tiktok(url) or _is_facebook(url)
+
+
 def _set_stage(job_id: str, settings, *, status: JobStatus, progress: int, message: str | None) -> None:
+    """
+    Update job progress for clients.
+
+    Internal retries stay on DOWNLOADING with a generic message so the UI never
+    surfaces retry bookkeeping (attempt counts, DNS waits, strategy names).
+    """
+    public_status = status
+    public_message = message
+    if status == JobStatus.RETRYING:
+        public_status = JobStatus.DOWNLOADING
+        public_message = "Downloading…"
     update_job_fields(
         job_id,
         settings.file_ttl_seconds,
-        status=status,
+        status=public_status,
         progress=progress,
-        message=message,
+        message=public_message,
         error=None,
     )
+
+
+def _retry_sleep(backoff: float, attempt: int) -> None:
+    """Exponential backoff: backoff * 2^(attempt-1), capped."""
+    delay = min(60.0, backoff * (2 ** max(0, attempt - 1)))
+    time.sleep(delay)
 
 
 def _progress_hook(job_id: str, start_time: float, timeout: int):
@@ -120,10 +154,12 @@ def _build_ydl_opts(
     q = effective_quality(quality, strategy)
 
     tiktok = _is_tiktok(url)
-    socket_timeout = (
-        settings.tiktok_socket_timeout if tiktok else settings.download_socket_timeout
+    facebook = _is_facebook(url)
+    socket_timeout = _socket_timeout_for(url, settings)
+    extra_retries = _needs_extra_retries(url)
+    fmt = resolve_ydl_format(
+        quality=q, url=url, is_tiktok=tiktok, is_facebook=facebook
     )
-    fmt = resolve_ydl_format(quality=q, url=url, is_tiktok=tiktok)
     audio_only = is_audio_quality(q)
 
     ydl_opts: dict = {
@@ -134,8 +170,8 @@ def _build_ydl_opts(
         "no_warnings": True,
         "progress_hooks": [_progress_hook(job_id, start, settings.job_timeout_seconds)],
         "socket_timeout": socket_timeout,
-        "retries": 10 if tiktok else 3,
-        "fragment_retries": 10 if tiktok else 3,
+        "retries": 10 if extra_retries else 3,
+        "fragment_retries": 10 if extra_retries else 3,
         "file_access_retries": 3,
         "max_filesize": settings.max_file_size_mb * 1024 * 1024,
         "match_filter": _duration_filter(settings.max_duration_seconds),
@@ -237,6 +273,7 @@ def _run_ytdlp_download(
             message=None,
             file_path=str(dest),
             file_name=safe_name,
+            file_size_mb=round(size_mb, 2),
             opaque_token=opaque,
             expires_at=expires_at,
         )
@@ -275,9 +312,18 @@ def download_media(self, job_id: str, url: str) -> dict:
     strategies = build_download_strategies(
         quality=quality,
         impersonate_available=impersonate_target is not None,
+        url=url,
     )
-    # Honor configured retry budget, but always cover the strategy ladder.
+    if _is_facebook(url) and impersonate_target is None:
+        log_event(
+            logger,
+            "facebook_without_impersonate",
+            job_id=job_id,
+            hint="Install curl_cffi for more reliable Facebook downloads",
+        )
+    # Strategy ladder + configured retry budget
     max_attempts = max(len(strategies), max(1, settings.download_retry_attempts))
+    network_retries = max(1, getattr(settings, "download_network_retries", 5))
 
     log_event(
         logger,
@@ -286,6 +332,8 @@ def download_media(self, job_id: str, url: str) -> dict:
         url_domain=_safe_domain(url),
         quality=quality,
         strategies=[s.name for s in strategies],
+        max_attempts=max_attempts,
+        network_retries=network_retries,
     )
 
     update_job_fields(
@@ -294,7 +342,7 @@ def download_media(self, job_id: str, url: str) -> dict:
         status=JobStatus.DOWNLOADING,
         progress=0,
         error=None,
-        message="Checking network…",
+        message="Downloading…",
         celery_task_id=self.request.id,
     )
 
@@ -310,13 +358,6 @@ def download_media(self, job_id: str, url: str) -> dict:
         has_next = attempt < max_attempts
 
         if attempt > 1:
-            _set_stage(
-                job_id,
-                settings,
-                status=JobStatus.RETRYING,
-                progress=0,
-                message=f"Retry {attempt}/{max_attempts}: {strategy.message}",
-            )
             log_event(
                 logger,
                 "download_retry",
@@ -325,98 +366,42 @@ def download_media(self, job_id: str, url: str) -> dict:
                 max_attempts=max_attempts,
                 strategy=strategy.name,
             )
-            time.sleep(backoff * (attempt - 1))
+            _retry_sleep(backoff, attempt - 1)
             _reset_tmp_dir(tmp_dir)
 
-        # DNS preflight — avoid burning a long yt-dlp hang when the host is unresolvable.
-        try:
+        # Per-strategy silent network/DNS retries (not shown to clients)
+        for net_try in range(1, network_retries + 1):
+            job = get_job(job_id)
+            if job and job.status == JobStatus.CANCELLED:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return {"job_id": job_id, "status": "cancelled"}
+
             _set_stage(
                 job_id,
                 settings,
-                status=JobStatus.DOWNLOADING if attempt == 1 else JobStatus.RETRYING,
+                status=JobStatus.DOWNLOADING,
                 progress=0,
-                message="Waiting for network…" if attempt > 1 else "Checking network…",
+                message="Downloading…",
             )
-            ensure_host_reachable(url)
-        except Exception as exc:
-            last_exc = exc
-            log_event(
-                logger,
-                "download_dns_wait",
-                job_id=job_id,
-                attempt=attempt,
-                error=str(exc)[:240],
-            )
-            if has_next:
-                _set_stage(
-                    job_id,
-                    settings,
-                    status=JobStatus.RETRYING,
-                    progress=0,
-                    message="Site unreachable (DNS) — waiting to retry…",
+
+            try:
+                ensure_host_reachable(url)
+            except Exception as exc:
+                last_exc = exc
+                log_event(
+                    logger,
+                    "download_dns_wait",
+                    job_id=job_id,
+                    attempt=attempt,
+                    net_try=net_try,
+                    network_retries=network_retries,
+                    error=str(exc)[:240],
                 )
-                time.sleep(backoff * attempt)
-                continue
-
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            msg = map_ytdlp_error(exc)
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.FAILED,
-                error=msg,
-                message=None,
-                progress=0,
-            )
-            log_event(logger, "download_failed", job_id=job_id, error=msg, attempts=attempt)
-            return {"job_id": job_id, "status": "failed", "error": msg}
-
-        try:
-            return _run_ytdlp_download(
-                job_id=job_id,
-                url=url,
-                tmp_dir=tmp_dir,
-                opaque=opaque,
-                start=start,
-                settings=settings,
-                storage=storage,
-                quality=quality,
-                audio_format=audio_format,
-                strategy=strategy,
-                impersonate_target=impersonate_target,
-            )
-
-        except JobCancelled:
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.CANCELLED,
-                error="Cancelled",
-                message=None,
-                progress=0,
-            )
-            log_event(logger, "download_cancelled", job_id=job_id)
-            return {"job_id": job_id, "status": "cancelled"}
-
-        except JobTimeout as exc:
-            # Time budget exhausted — do not keep retrying past the job timeout.
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            msg = map_ytdlp_error(exc)
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.FAILED,
-                error=msg,
-                message=None,
-                progress=0,
-            )
-            log_event(logger, "download_timeout", job_id=job_id, error=msg)
-            return {"job_id": job_id, "status": "failed"}
-
-        except Exception as exc:
-            last_exc = exc
-            if is_permanent_error(exc):
+                if net_try < network_retries:
+                    _retry_sleep(backoff, net_try)
+                    continue
+                if has_next:
+                    break  # advance strategy ladder
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 msg = map_ytdlp_error(exc)
                 update_job_fields(
@@ -429,47 +414,122 @@ def download_media(self, job_id: str, url: str) -> dict:
                 )
                 log_event(
                     logger,
-                    "download_failed_permanent",
+                    "download_failed",
+                    job_id=job_id,
+                    error=msg,
+                    attempts=attempt,
+                )
+                return {"job_id": job_id, "status": "failed", "error": msg}
+
+            try:
+                return _run_ytdlp_download(
+                    job_id=job_id,
+                    url=url,
+                    tmp_dir=tmp_dir,
+                    opaque=opaque,
+                    start=start,
+                    settings=settings,
+                    storage=storage,
+                    quality=quality,
+                    audio_format=audio_format,
+                    strategy=strategy,
+                    impersonate_target=impersonate_target,
+                )
+
+            except JobCancelled:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                update_job_fields(
+                    job_id,
+                    settings.file_ttl_seconds,
+                    status=JobStatus.CANCELLED,
+                    error="Cancelled",
+                    message=None,
+                    progress=0,
+                )
+                log_event(logger, "download_cancelled", job_id=job_id)
+                return {"job_id": job_id, "status": "cancelled"}
+
+            except JobTimeout as exc:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                msg = map_ytdlp_error(exc)
+                update_job_fields(
+                    job_id,
+                    settings.file_ttl_seconds,
+                    status=JobStatus.FAILED,
+                    error=msg,
+                    message=None,
+                    progress=0,
+                )
+                log_event(logger, "download_timeout", job_id=job_id, error=msg)
+                return {"job_id": job_id, "status": "failed"}
+
+            except Exception as exc:
+                last_exc = exc
+                if is_permanent_error(exc):
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    msg = map_ytdlp_error(exc)
+                    update_job_fields(
+                        job_id,
+                        settings.file_ttl_seconds,
+                        status=JobStatus.FAILED,
+                        error=msg,
+                        message=None,
+                        progress=0,
+                    )
+                    log_event(
+                        logger,
+                        "download_failed_permanent",
+                        job_id=job_id,
+                        error=msg,
+                        attempts=attempt,
+                        strategy=strategy.name,
+                    )
+                    return {"job_id": job_id, "status": "failed", "error": msg}
+
+                # Transient / setup / format: silent network retry, then strategy fallback
+                can_net_retry = net_try < network_retries
+                can_strategy = is_retryable_with_fallback(
+                    exc, has_next_strategy=has_next
+                )
+                log_event(
+                    logger,
+                    "download_fallback",
+                    job_id=job_id,
+                    attempt=attempt,
+                    net_try=net_try,
+                    strategy=strategy.name,
+                    can_net_retry=can_net_retry,
+                    can_strategy=can_strategy,
+                    error=f"{type(exc).__name__}: {_safe_err(exc)}"[:240],
+                )
+                if can_net_retry:
+                    _retry_sleep(backoff, net_try)
+                    _reset_tmp_dir(tmp_dir)
+                    continue
+                if can_strategy:
+                    break  # next strategy
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                msg = map_ytdlp_error(exc)
+                update_job_fields(
+                    job_id,
+                    settings.file_ttl_seconds,
+                    status=JobStatus.FAILED,
+                    error=msg,
+                    message=None,
+                    progress=0,
+                )
+                log_event(
+                    logger,
+                    "download_failed",
                     job_id=job_id,
                     error=msg,
                     attempts=attempt,
                     strategy=strategy.name,
                 )
                 return {"job_id": job_id, "status": "failed", "error": msg}
-
-            if is_retryable_with_fallback(exc, has_next_strategy=has_next):
-                log_event(
-                    logger,
-                    "download_fallback",
-                    job_id=job_id,
-                    attempt=attempt,
-                    strategy=strategy.name,
-                    next_strategy=strategies[min(attempt, len(strategies) - 1)].name
-                    if has_next
-                    else None,
-                    error=f"{type(exc).__name__}: {_safe_err(exc)}"[:240],
-                )
-                continue
-
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            msg = map_ytdlp_error(exc)
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.FAILED,
-                error=msg,
-                message=None,
-                progress=0,
-            )
-            log_event(
-                logger,
-                "download_failed",
-                job_id=job_id,
-                error=msg,
-                attempts=attempt,
-                strategy=strategy.name,
-            )
-            return {"job_id": job_id, "status": "failed", "error": msg}
+        else:
+            # network loop exhausted without break → continue outer attempts
+            continue
 
     # Defensive fallback — loop should always return above.
     shutil.rmtree(tmp_dir, ignore_errors=True)

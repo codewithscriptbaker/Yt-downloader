@@ -8,7 +8,21 @@ logger = logging.getLogger(__name__)
 
 
 ERROR_MAP = [
-    (re.compile(r"private video|login required|sign in", re.I), "This video is private or requires login."),
+    (
+        re.compile(
+            r"only available to friends|friends only|login to continue|"
+            r"you must log in|must be logged in|log in to see|"
+            r"this content isn.?t available right now|"
+            r"content isn.?t available right now|"
+            r"page isn.?t available",
+            re.I,
+        ),
+        "This Facebook post isn’t publicly viewable.",
+    ),
+    (
+        re.compile(r"private video|login required|sign in to|sign in$", re.I),
+        "This video is private or requires login.",
+    ),
     (re.compile(r"geo.?restrict|not available in your country|blocked in your country", re.I), "This media is geo-blocked in this region."),
     (re.compile(r"video unavailable|unavailable|removed|deleted", re.I), "This media is unavailable or has been removed."),
     (re.compile(r"no video formats|requested format is not available", re.I), "Could not find a downloadable format for this media."),
@@ -28,6 +42,13 @@ ERROR_MAP = [
     ),
     (
         re.compile(
+            r"cannot parse data|unable to extract.+facebook|facebook.+cannot",
+            re.I,
+        ),
+        "Facebook couldn’t process this link right now. If the post is public, try again in a moment.",
+    ),
+    (
+        re.compile(
             r"getaddrinfo failed|name or service not known|nodename nor servname|"
             r"temporary failure in name resolution|dns|failed to resolve|"
             r"could not resolve host|curl:\s*\(6\)|"
@@ -43,6 +64,10 @@ ERROR_MAP = [
 
 # Short next-step hints keyed by the same friendly messages (or pattern).
 ERROR_HINTS = [
+    (
+        re.compile(r"isn.?t publicly viewable|friends only|private or requires login", re.I),
+        "Open the link in a private/incognito window. If Facebook asks you to log in, only the owner can view it — paste a public post instead.",
+    ),
     (re.compile(r"private|login|sign in", re.I), "Only public media can be downloaded. Try a different public link."),
     (re.compile(r"geo-blocked|country", re.I), "This title isn’t available from our region. A different link may work."),
     (re.compile(r"unavailable|removed", re.I), "Check the link is still live, then try again."),
@@ -51,9 +76,13 @@ ERROR_HINTS = [
     (re.compile(r"maximum allowed size|larger", re.I), "Try a lower quality, or a shorter clip."),
     (re.compile(r"rate-limiting|try again later", re.I), "Wait a few minutes, then retry the same link."),
     (re.compile(r"duration limit|longer than", re.I), "Pick a shorter video under the duration cap."),
-    (re.compile(r"supported site", re.I), "Use a YouTube, TikTok, or Instagram link."),
+    (re.compile(r"supported site", re.I), "Use a YouTube, TikTok, Instagram, or Facebook link."),
     (re.compile(r"TikTok blocked|rehydration", re.I), "Open the clip in a browser to confirm it’s public, then paste the link again."),
-    (re.compile(r"Couldn't reach the site", re.I), "Check your connection, then tap Retry."),
+    (
+        re.compile(r"Facebook couldn.?t process|couldn.?t process this link", re.I),
+        "Confirm the post plays without logging in, then retry. Public watch/reel links work best.",
+    ),
+    (re.compile(r"Couldn't reach the site", re.I), "The media site was temporarily unreachable. Try again shortly."),
 ]
 
 # Errors that are usually short-lived — retry instead of failing the job immediately.
@@ -74,11 +103,22 @@ TRANSIENT_PATTERNS = [
     re.compile(r"timed? ?out|timeout|socket.?timeout|read timed out", re.I),
     re.compile(r"ssl|eof occurred|remote end closed", re.I),
     re.compile(r"temporary failure|try again later", re.I),
+    # Facebook flaky parse / CDN — worth retrying with next strategy
+    re.compile(r"cannot parse data", re.I),
 ]
 
 # Permanent failures — never retry / never advance fallback ladder.
 PERMANENT_PATTERNS = [
     re.compile(r"private video|login required|sign in", re.I),
+    re.compile(
+        r"only available to friends|friends only|login to continue|"
+        r"you must log in|must be logged in|log in to see|"
+        r"this content isn.?t available right now|"
+        r"content isn.?t available right now|"
+        r"page isn.?t available|"
+        r"isn.?t publicly viewable",
+        re.I,
+    ),
     re.compile(r"geo.?restrict|not available in your country|blocked in your country", re.I),
     re.compile(r"video unavailable|has been removed|uploader has closed", re.I),
     re.compile(r"copyright|dmca", re.I),
@@ -199,7 +239,7 @@ def hint_for_error(friendly_or_raw: str | None) -> str | None:
     if not friendly_or_raw:
         return None
     if "client setup failed" in friendly_or_raw.lower():
-        return "Tap Retry — the next attempt uses a safer download method."
+        return "Start the download again — a different method is used automatically."
     for pattern, hint in ERROR_HINTS:
         if pattern.search(friendly_or_raw):
             return hint

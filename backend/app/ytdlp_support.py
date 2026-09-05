@@ -54,16 +54,54 @@ def build_download_strategies(
     *,
     quality: str,
     impersonate_available: bool,
+    url: str | None = None,
 ) -> list[DownloadStrategy]:
     """
     Production fallback ladder:
 
-    1. Default yt-dlp clients (full YouTube format ladder)
-    2. Impersonate when available (helps some sites / bot checks)
-    3. Compat: android/web + softer height
+    YouTube / Instagram / TikTok:
+      1. Default clients → 2. Impersonate → 3. Soft format
+
+    Facebook (impersonate-first — FB fingerprinting often breaks without it):
+      1. Impersonate → 2. Standard → 3. Soft progressive format
     """
     q = (quality or "best").lower()
-    strategies: list[DownloadStrategy] = [
+    facebook = bool(url and is_facebook_url(url))
+
+    if facebook:
+        strategies: list[DownloadStrategy] = []
+        if impersonate_available:
+            strategies.append(
+                DownloadStrategy(
+                    name="impersonate",
+                    use_impersonate=True,
+                    player_clients=(),
+                    soft_format=False,
+                    message="Fetching media (secure client)…",
+                )
+            )
+        strategies.append(
+            DownloadStrategy(
+                name="standard",
+                use_impersonate=False,
+                player_clients=(),
+                soft_format=False,
+                message="Fetching media…",
+            )
+        )
+        if q != "audio":
+            strategies.append(
+                DownloadStrategy(
+                    name="compat",
+                    use_impersonate=impersonate_available,
+                    player_clients=(),
+                    soft_format=True,
+                    message="Retrying with compatible format…",
+                )
+            )
+        return strategies
+
+    strategies = [
         DownloadStrategy(
             name="standard",
             use_impersonate=False,
@@ -162,6 +200,10 @@ def apply_common_opts(
     # TikTok challenge pages often break under chrome impersonate.
     if url and is_tiktok_url(url):
         use_imp = False
+    # Facebook often requires chrome impersonate to parse webpage/API payloads.
+    if url and is_facebook_url(url) and impersonate_target is not None:
+        if strategy is None or strategy.use_impersonate:
+            use_imp = True
     if use_imp and impersonate_target is not None:
         ydl_opts["impersonate"] = impersonate_target
     else:
@@ -176,31 +218,69 @@ def apply_common_opts(
         ydl_opts["proxy"] = proxy
 
     if url:
-        apply_site_compat(ydl_opts, url)
+        apply_site_compat(ydl_opts, url, impersonate_target=impersonate_target)
 
     return ydl_opts
 
 
-def is_tiktok_url(url: str) -> bool:
+def _url_host(url: str) -> str:
     try:
         from urllib.parse import urlparse
 
-        host = (urlparse(url).hostname or "").lower()
+        return (urlparse(url).hostname or "").lower()
     except Exception:
-        return "tiktok.com" in (url or "").lower()
-    return "tiktok.com" in host
+        return ""
 
 
-def apply_site_compat(ydl_opts: dict[str, Any], url: str) -> dict[str, Any]:
+def is_tiktok_url(url: str) -> bool:
+    host = _url_host(url)
+    if host:
+        return "tiktok.com" in host
+    return "tiktok.com" in (url or "").lower()
+
+
+def is_facebook_url(url: str) -> bool:
+    host = _url_host(url)
+    if not host:
+        lowered = (url or "").lower()
+        return any(t in lowered for t in ("facebook.com", "fb.watch", "fb.com"))
+    return (
+        "facebook.com" in host
+        or host == "fb.watch"
+        or host.endswith(".fb.watch")
+        or host == "fb.com"
+        or host.endswith(".fb.com")
+    )
+
+
+def apply_site_compat(
+    ydl_opts: dict[str, Any],
+    url: str,
+    *,
+    impersonate_target: Any | None = None,
+) -> dict[str, Any]:
     """
     Site-specific yt-dlp tweaks.
 
-    TikTok often serves a JS challenge when chrome impersonate is used, which
-    surfaces as "Unable to extract universal data for rehydration". Prefer the
-    default client (no impersonate) for TikTok URLs.
+    TikTok: chrome impersonate often triggers JS challenges — disable it.
+    Facebook: prefer chrome impersonate + slightly friendlier retries/headers.
     """
-    if not is_tiktok_url(url):
+    if is_tiktok_url(url):
+        ydl_opts.pop("impersonate", None)
         return ydl_opts
 
-    ydl_opts.pop("impersonate", None)
+    if is_facebook_url(url):
+        # Prefer progressive / mobile-friendly Accept when FB is picky.
+        headers = dict(ydl_opts.get("http_headers") or {})
+        headers.setdefault(
+            "Accept",
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        )
+        headers.setdefault("Accept-Language", "en-US,en;q=0.9")
+        ydl_opts["http_headers"] = headers
+        # Extra fragment retries help flaky FB CDN edges.
+        ydl_opts.setdefault("retries", 10)
+        ydl_opts.setdefault("fragment_retries", 10)
+        return ydl_opts
+
     return ydl_opts

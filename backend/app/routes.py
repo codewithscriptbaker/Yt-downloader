@@ -16,8 +16,27 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
+from app.capabilities import probe_download_capabilities
 from app.captcha import verify_captcha
 from app.config import Settings, get_settings
+from app.auth import (
+    AuthResponse,
+    AuthUser,
+    HistoryCreateRequest,
+    HistoryItemOut,
+    HistoryListResponse,
+    LoginRequest,
+    SignupRequest,
+    add_history,
+    authenticate_user,
+    clear_history,
+    create_access_token,
+    create_user,
+    delete_history_item,
+    list_history,
+    require_user,
+    _user_from_record,
+)
 from app.errors import hint_for_error
 from app.jobs import (
     count_active_jobs_for_ip,
@@ -70,12 +89,67 @@ def client_ip(request: Request) -> str:
 def health(settings: Settings = Depends(get_settings)) -> HealthResponse:
     redis_ok = ping_redis()
     usage = disk_usage_mb(settings)
+    caps = probe_download_capabilities(settings)
+    # Degrade when Redis is down; capability gaps stay "ok" with warnings
+    # so load balancers don't kill the API for missing optional curl_cffi.
+    status_value = "ok" if redis_ok else "degraded"
     return HealthResponse(
-        status="ok" if redis_ok else "degraded",
+        status=status_value,
         redis="up" if redis_ok else "down",
         disk_usage_mb=round(usage, 2),
         disk_limit_mb=settings.disk_usage_limit_mb,
+        impersonate_available=caps.impersonate_available,
+        cookies_configured=caps.cookies_configured,
+        cookies_readable=caps.cookies_readable,
+        facebook_ready=caps.facebook_ready,
+        warnings=caps.warnings,
     )
+
+
+@router.post("/api/auth/signup", response_model=AuthResponse, status_code=status.HTTP_201_CREATED)
+def signup(body: SignupRequest, settings: Settings = Depends(get_settings)) -> AuthResponse:
+    user = create_user(email=str(body.email), password=body.password, name=body.name)
+    token = create_access_token(user["user_id"], user["email"], settings)
+    log_event(logger, "user_signup", user_id=user["user_id"])
+    return AuthResponse(access_token=token, user=_user_from_record(user))
+
+
+@router.post("/api/auth/login", response_model=AuthResponse)
+def login(body: LoginRequest, settings: Settings = Depends(get_settings)) -> AuthResponse:
+    user = authenticate_user(str(body.email), body.password)
+    token = create_access_token(user["user_id"], user["email"], settings)
+    log_event(logger, "user_login", user_id=user["user_id"])
+    return AuthResponse(access_token=token, user=_user_from_record(user))
+
+
+@router.get("/api/auth/me", response_model=AuthUser)
+def auth_me(user: AuthUser = Depends(require_user)) -> AuthUser:
+    return user
+
+
+@router.get("/api/history", response_model=HistoryListResponse)
+def get_history(user: AuthUser = Depends(require_user)) -> HistoryListResponse:
+    return HistoryListResponse(items=list_history(user.user_id))
+
+
+@router.post("/api/history", response_model=HistoryItemOut, status_code=status.HTTP_201_CREATED)
+def post_history(
+    body: HistoryCreateRequest,
+    user: AuthUser = Depends(require_user),
+) -> HistoryItemOut:
+    return add_history(user.user_id, body)
+
+
+@router.delete("/api/history", status_code=status.HTTP_204_NO_CONTENT)
+def wipe_history(user: AuthUser = Depends(require_user)):
+    clear_history(user.user_id)
+    return None
+
+
+@router.delete("/api/history/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_history_item(item_id: str, user: AuthUser = Depends(require_user)):
+    delete_history_item(user.user_id, item_id)
+    return None
 
 
 @router.post("/api/jobs", response_model=CreateJobResponse, status_code=status.HTTP_201_CREATED)
@@ -281,18 +355,52 @@ def get_job_status(
         )
         download_url = build_download_path(job.job_id, token, job.file_name)
 
+    public_status = JobStatus.DOWNLOADING if job.status == JobStatus.RETRYING else job.status
+    public_message = (
+        "Downloading…"
+        if job.status == JobStatus.RETRYING
+        else job.message
+    )
+    queue_position = None
+    if job.status == JobStatus.QUEUED:
+        queue_position = _estimate_queue_position(job)
+        if queue_position and queue_position > 1:
+            public_message = f"Waiting — about {queue_position - 1} job(s) ahead"
+        else:
+            public_message = public_message or "Waiting for a free worker…"
+
     return JobStatusResponse(
         job_id=job.job_id,
-        status=job.status,
+        status=public_status,
         progress=job.progress,
         error=job.error,
         error_hint=hint_for_error(job.error) if job.error else None,
-        message=job.message,
+        message=public_message,
         download_url=download_url,
         expires_at=job.expires_at,
         quality=job.quality,
         audio_format=job.audio_format,
+        file_name=job.file_name,
+        file_size_mb=getattr(job, "file_size_mb", None),
+        queue_position=queue_position,
     )
+
+
+def _estimate_queue_position(job) -> int | None:
+    """Rough queue depth: how many older queued jobs exist (1 = next)."""
+    try:
+        from app.jobs import list_all_job_ids
+
+        ahead = 0
+        for other_id in list_all_job_ids():
+            other = get_job(other_id)
+            if not other or other.status != JobStatus.QUEUED:
+                continue
+            if other.created_at < job.created_at:
+                ahead += 1
+        return ahead + 1
+    except Exception:
+        return None
 
 
 @router.get("/api/jobs/{job_id}/download", response_model=DownloadResponse)
@@ -439,14 +547,23 @@ async def job_status_ws(websocket: WebSocket, job_id: str):
 def _ws_payload(job) -> dict:
     from app.errors import hint_for_error
 
+    status = job.status.value if hasattr(job.status, "value") else job.status
+    message = getattr(job, "message", None)
+    # Never expose internal retry state to the browser
+    if status == "retrying":
+        status = "downloading"
+        message = "Downloading…"
+
     return {
         "job_id": job.job_id,
-        "status": job.status.value if hasattr(job.status, "value") else job.status,
+        "status": status,
         "progress": job.progress,
         "error": job.error,
         "error_hint": hint_for_error(job.error) if job.error else None,
-        "message": getattr(job, "message", None),
+        "message": message,
         "expires_at": job.expires_at,
         "quality": getattr(job, "quality", None),
         "audio_format": getattr(job, "audio_format", None),
+        "file_name": getattr(job, "file_name", None),
+        "file_size_mb": getattr(job, "file_size_mb", None),
     }

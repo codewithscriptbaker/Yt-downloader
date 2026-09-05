@@ -48,6 +48,7 @@ def create_job(
         ip=ip,
         quality=quality,
         audio_format=audio_format,
+        message="Waiting for a free worker…",
     )
     pipe = r.pipeline()
     pipe.set(_job_key(job_id), record.model_dump_json(), ex=ttl_seconds + 3600)
@@ -83,16 +84,25 @@ def save_job(record: JobRecord, ttl_seconds: int) -> None:
 def publish_job_update(record: JobRecord) -> None:
     from app.errors import hint_for_error
 
+    # Hide internal retry bookkeeping from clients — always look like a normal download.
+    status = record.status
+    message = record.message
+    if status == JobStatus.RETRYING:
+        status = JobStatus.DOWNLOADING
+        message = "Downloading…"
+
     payload = {
         "job_id": record.job_id,
-        "status": record.status.value,
+        "status": status.value,
         "progress": record.progress,
         "error": record.error,
         "error_hint": hint_for_error(record.error) if record.error else None,
-        "message": record.message,
+        "message": message,
         "expires_at": record.expires_at,
         "quality": record.quality,
         "audio_format": record.audio_format,
+        "file_name": record.file_name,
+        "file_size_mb": getattr(record, "file_size_mb", None),
     }
     get_redis().publish(JOB_STATUS_CHANNEL.format(job_id=record.job_id), json.dumps(payload))
 

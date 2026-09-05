@@ -1,6 +1,6 @@
-# Media Downloader
+# MediaPort
 
-Public anonymous downloader for YouTube, TikTok, and Instagram.
+Public anonymous media downloader for YouTube, TikTok, Instagram, and Facebook.
 
 ## Stack
 
