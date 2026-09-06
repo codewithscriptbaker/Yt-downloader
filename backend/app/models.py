@@ -1,7 +1,7 @@
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.formats import normalize_quality, quality_is_allowed
 
@@ -131,17 +131,94 @@ class JobStatusResponse(BaseModel):
     error_hint: Optional[str] = None
     message: Optional[str] = None
     download_url: Optional[str] = None
+    original_download_url: Optional[str] = None
     expires_at: Optional[float] = None
     quality: Optional[str] = None
     audio_format: Optional[str] = None
     file_name: Optional[str] = None
     file_size_mb: Optional[float] = None
+    original_file_size_mb: Optional[float] = None
+    has_trim: bool = False
+    has_previous_edit: bool = False
     queue_position: Optional[int] = None
 
 
 class DownloadResponse(BaseModel):
     download_url: str
     expires_in: int
+
+
+class TrimJobRequest(BaseModel):
+    """Trim a ready media file to [start_seconds, end_seconds)."""
+
+    start_seconds: float = Field(..., ge=0, le=86_400)
+    end_seconds: float = Field(..., gt=0, le=86_400)
+    # Video only: force re-encode for frame-accurate cuts (slower).
+    precise: bool = False
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> "TrimJobRequest":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        if self.end_seconds - self.start_seconds < 0.25:
+            raise ValueError("Select at least 0.25 seconds to keep")
+        return self
+
+
+class EditTimeRange(BaseModel):
+    start_seconds: float = Field(..., ge=0, le=86_400)
+    end_seconds: float = Field(..., gt=0, le=86_400)
+
+    @model_validator(mode="after")
+    def _end_after_start(self) -> "EditTimeRange":
+        if self.end_seconds <= self.start_seconds:
+            raise ValueError("end_seconds must be greater than start_seconds")
+        if self.end_seconds - self.start_seconds < 0.25:
+            raise ValueError("Each segment must be at least 0.25 seconds")
+        return self
+
+
+class ComposeEditRequest(BaseModel):
+    """Keep multiple ranges (in order) and stitch into one file."""
+
+    ranges: list[EditTimeRange] = Field(..., min_length=1, max_length=20)
+    precise: bool = False
+
+
+class InsertEditFormMeta(BaseModel):
+    """Validated form fields for multipart insert (file uploaded separately)."""
+
+    at_seconds: float = Field(..., ge=0, le=86_400)
+    replace_audio: bool = False
+    crossfade_seconds: float = Field(0.0, ge=0, le=2.0)
+
+
+class TrimJobResponse(BaseModel):
+    job_id: str
+    download_url: str
+    original_download_url: Optional[str] = None
+    expires_in: int
+    expires_at: float
+    file_size_mb: float
+    original_file_size_mb: Optional[float] = None
+    duration_seconds: float
+    kind: Literal["audio", "video"] = "audio"
+    has_trim: bool = True
+    has_previous_edit: bool = False
+    operation: Optional[str] = None
+
+
+# Alias for compose / insert / restore / undo
+EditJobResponse = TrimJobResponse
+
+
+class WaveformResponse(BaseModel):
+    duration_seconds: float
+    peaks: list[float]
+    has_video: bool
+    has_audio: bool
+    kind: Literal["audio", "video"]
+    bar_count: int
 
 
 class HealthResponse(BaseModel):
@@ -169,6 +246,14 @@ class JobRecord(BaseModel):
     file_path: Optional[str] = None
     file_name: Optional[str] = None
     file_size_mb: Optional[float] = None
+    original_file_path: Optional[str] = None
+    original_file_name: Optional[str] = None
+    original_file_size_mb: Optional[float] = None
+    has_trim: bool = False
+    previous_file_path: Optional[str] = None
+    previous_file_name: Optional[str] = None
+    previous_file_size_mb: Optional[float] = None
+    has_previous_edit: bool = False
     opaque_token: Optional[str] = None
     ip: str
     celery_task_id: Optional[str] = None

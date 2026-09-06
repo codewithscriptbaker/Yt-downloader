@@ -1,13 +1,10 @@
 "use client";
 
-import { useState } from "react";
-import { AuthModal } from "@/components/AuthModal";
+import Link from "next/link";
 import { useAuth } from "@/components/AuthProvider";
 
 export function AuthButtons() {
   const { user, logout, ready } = useAuth();
-  const [open, setOpen] = useState(false);
-  const [mode, setMode] = useState<"login" | "signup">("login");
 
   if (!ready) {
     return <span className="auth-buttons auth-buttons--placeholder" aria-hidden />;
@@ -27,34 +24,16 @@ export function AuthButtons() {
   }
 
   return (
-    <>
-      <div className="auth-buttons">
-        <button
-          type="button"
-          className="btn btn--ghost btn--small auth-buttons__login"
-          onClick={() => {
-            setMode("login");
-            setOpen(true);
-          }}
-        >
-          Log in
-        </button>
-        <button
-          type="button"
-          className="btn btn--primary btn--small auth-buttons__signup"
-          onClick={() => {
-            setMode("signup");
-            setOpen(true);
-          }}
-        >
-          Sign up
-        </button>
-      </div>
-      <AuthModal
-        open={open}
-        initialMode={mode}
-        onClose={() => setOpen(false)}
-      />
-    </>
+    <div className="auth-buttons">
+      <Link href="/login" className="btn btn--ghost btn--small auth-buttons__login">
+        Log in
+      </Link>
+      <Link
+        href="/signup"
+        className="btn btn--primary btn--small auth-buttons__signup"
+      >
+        Sign up
+      </Link>
+    </div>
   );
 }

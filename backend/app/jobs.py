@@ -103,6 +103,9 @@ def publish_job_update(record: JobRecord) -> None:
         "audio_format": record.audio_format,
         "file_name": record.file_name,
         "file_size_mb": getattr(record, "file_size_mb", None),
+        "original_file_size_mb": getattr(record, "original_file_size_mb", None),
+        "has_trim": bool(getattr(record, "has_trim", False)),
+        "has_previous_edit": bool(getattr(record, "has_previous_edit", False)),
     }
     get_redis().publish(JOB_STATUS_CHANNEL.format(job_id=record.job_id), json.dumps(payload))
 

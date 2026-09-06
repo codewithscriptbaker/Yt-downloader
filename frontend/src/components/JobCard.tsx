@@ -12,10 +12,18 @@ import {
   statusMessage,
 } from "@/lib/format";
 import { isActiveStatus } from "@/lib/types";
+import type { TrimJobResponse } from "@/lib/types";
 import type { TrackedJob } from "@/hooks/useJobTracker";
 import { useJobTracker } from "@/hooks/useJobTracker";
-import { absoluteDownloadUrl, getDownloadLink } from "@/lib/api";
+import {
+  absoluteDownloadUrl,
+  getDownloadLink,
+  restoreJobMedia,
+  undoJobMedia,
+} from "@/lib/api";
 import { useAuth } from "@/components/AuthProvider";
+import { MediaTrimEditor } from "@/components/MediaTrimEditor";
+import { guessMediaKind, isTrimmableMedia } from "@/lib/mediaTrim";
 
 type Props = {
   initial: TrackedJob;
@@ -25,12 +33,16 @@ type Props = {
 };
 
 export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
-  const { job, cancelling, cancelError, cancel } = useJobTracker(initial);
+  const { job, setJob, cancelling, cancelError, cancel } = useJobTracker(initial);
   const { recordHistory } = useAuth();
   const [refreshing, setRefreshing] = useState(false);
   const [retrying, setRetrying] = useState(false);
   const [refreshError, setRefreshError] = useState<string | null>(null);
   const [linkOverride, setLinkOverride] = useState<string | null>(null);
+  const [originalOverride, setOriginalOverride] = useState<string | null>(null);
+  const [trimming, setTrimming] = useState(false);
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState<string | null>(
     formatCountdown(job.expires_at),
   );
@@ -38,7 +50,22 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
   const active = isActiveStatus(job.status);
   const pct = Math.max(0, Math.min(100, job.progress || 0));
   const downloadHref = linkOverride || job.absolute_download_url;
+  const originalHref =
+    originalOverride || job.absolute_original_download_url || null;
+  const hasTrim = Boolean(job.has_trim && originalHref);
+  const hasPreviousEdit = Boolean(job.has_previous_edit);
   const sizeMb = job.file_size_mb ?? job.estimated_size_mb ?? null;
+  const originalSizeMb = job.original_file_size_mb ?? null;
+  const trimSourceUrl = originalHref || downloadHref;
+  const canTrim =
+    job.status === "done" &&
+    !!trimSourceUrl &&
+    isTrimmableMedia({ quality: job.quality, fileName: job.file_name });
+  const trimKind = guessMediaKind({
+    quality: job.quality,
+    fileName: job.file_name,
+  });
+  const trimLabel = trimKind === "video" ? "Edit video" : "Edit audio";
 
   useEffect(() => {
     onJobUpdate?.(job);
@@ -106,12 +133,75 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
     }
   };
 
+  const handleTrimmed = (result: TrimJobResponse) => {
+    const abs = absoluteDownloadUrl(result.download_url);
+    const absOriginal = result.original_download_url
+      ? absoluteDownloadUrl(result.original_download_url)
+      : null;
+    setLinkOverride(abs);
+    if (absOriginal) setOriginalOverride(absOriginal);
+    setJob((prev) => ({
+      ...prev,
+      status: "done",
+      progress: 100,
+      download_url: result.download_url,
+      absolute_download_url: abs,
+      original_download_url: result.original_download_url ?? null,
+      absolute_original_download_url: absOriginal,
+      file_size_mb: result.file_size_mb,
+      original_file_size_mb: result.original_file_size_mb ?? null,
+      has_trim: Boolean(result.has_trim),
+      has_previous_edit: Boolean(result.has_previous_edit),
+      expires_at: result.expires_at,
+      message: null,
+      error: null,
+    }));
+    setTrimming(false);
+    setEditError(null);
+  };
+
+  const handleRestore = async () => {
+    if (editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const result = await restoreJobMedia(job.job_id);
+      handleTrimmed(result);
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Restore failed");
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const handleUndo = async () => {
+    if (editBusy) return;
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const result = await undoJobMedia(job.job_id);
+      handleTrimmed(result);
+    } catch (err) {
+      setEditError(err instanceof Error ? err.message : "Undo failed");
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
   const failure = softFailureCopy(job.error, job.error_hint);
-  const btnLabel = downloadButtonLabel({
+  const trimmedLabel = downloadButtonLabel({
     fileName: job.file_name,
     fileSizeMb: sizeMb,
     quality: job.quality,
     audioFormat: job.audio_format,
+    prefix: hasTrim ? "Download trimmed" : "Download",
+  });
+  const originalLabel = downloadButtonLabel({
+    fileName: job.file_name,
+    fileSizeMb: originalSizeMb,
+    quality: job.quality,
+    audioFormat: job.audio_format,
+    prefix: "Download original",
   });
 
   return (
@@ -128,11 +218,39 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
       <div className="job-card__body">
         <div className="job-card__top">
           <h3 className="job-card__title">{job.title || "Download"}</h3>
-          <span
-            className={`job-pill job-pill--${job.status === "retrying" ? "downloading" : job.status}`}
-          >
-            {statusLabel(job.status)}
-          </span>
+          <div className="job-card__top-end">
+            {job.status !== "done" && (
+              <span
+                className={`job-pill job-pill--${job.status === "retrying" ? "downloading" : job.status}`}
+              >
+                {statusLabel(job.status)}
+              </span>
+            )}
+            {!active && onDismiss && (
+              <button
+                type="button"
+                className="job-card__close"
+                onClick={() => onDismiss(job.job_id)}
+                aria-label="Close"
+                title="Close"
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 14 14"
+                  fill="none"
+                  aria-hidden
+                >
+                  <path
+                    d="M3.5 3.5l7 7M10.5 3.5l-7 7"
+                    stroke="currentColor"
+                    strokeWidth="1.75"
+                    strokeLinecap="round"
+                  />
+                </svg>
+              </button>
+            )}
+          </div>
         </div>
 
         {active && (
@@ -163,9 +281,49 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
 
         {job.status === "done" && downloadHref && (
           <div className="job-card__done">
-            <a className="btn btn--primary" href={downloadHref} download>
-              {btnLabel}
+            <a className="btn btn--primary btn--small" href={downloadHref} download>
+              {trimmedLabel}
             </a>
+            {hasTrim && originalHref && (
+              <a
+                className="btn btn--ghost btn--small"
+                href={originalHref}
+                download
+              >
+                {originalLabel}
+              </a>
+            )}
+            {canTrim && (
+              <button
+                type="button"
+                className="btn btn--ghost btn--small"
+                onClick={() => setTrimming(true)}
+                disabled={editBusy}
+              >
+                {trimLabel}
+              </button>
+            )}
+            {hasPreviousEdit && (
+              <button
+                type="button"
+                className="btn btn--ghost btn--small"
+                onClick={() => void handleUndo()}
+                disabled={editBusy}
+              >
+                {editBusy ? "Working…" : "Undo last edit"}
+              </button>
+            )}
+            {hasTrim && (
+              <button
+                type="button"
+                className="btn btn--ghost btn--small"
+                onClick={() => void handleRestore()}
+                disabled={editBusy}
+                title="Restore the full original download"
+              >
+                Restore original
+              </button>
+            )}
             <button
               type="button"
               className="btn btn--ghost btn--small"
@@ -184,11 +342,26 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
           </div>
         )}
 
+        {job.status === "done" && trimSourceUrl && trimming && (
+          <MediaTrimEditor
+            jobId={job.job_id}
+            downloadUrl={trimSourceUrl}
+            kind={trimKind}
+            fileLabel={
+              trimKind === "audio" && job.audio_format
+                ? job.audio_format.toUpperCase()
+                : job.file_name?.split(".").pop()?.toUpperCase()
+            }
+            onCancel={() => setTrimming(false)}
+            onTrimmed={handleTrimmed}
+          />
+        )}
+
         {job.status === "done" && !downloadHref && (
           <div className="job-card__done">
             <button
               type="button"
-              className="btn btn--primary"
+              className="btn btn--primary btn--small"
               onClick={() => void refreshLink()}
               disabled={refreshing}
             >
@@ -197,9 +370,9 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
           </div>
         )}
 
-        {(refreshError || cancelError) && (
+        {(refreshError || cancelError || editError) && (
           <p className="form-hint form-hint--error" role="alert">
-            {refreshError || cancelError}
+            {refreshError || cancelError || editError}
           </p>
         )}
 
@@ -222,15 +395,6 @@ export function JobCard({ initial, onDismiss, onRetry, onJobUpdate }: Props) {
               disabled={retrying}
             >
               {retrying ? "Retrying…" : "Try again"}
-            </button>
-          )}
-          {!active && onDismiss && (
-            <button
-              type="button"
-              className="btn btn--ghost"
-              onClick={() => onDismiss(job.job_id)}
-            >
-              Dismiss
             </button>
           )}
           {(job.quality || sizeMb != null) && (

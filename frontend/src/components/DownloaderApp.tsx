@@ -43,7 +43,12 @@ import {
   type HistoryItem,
   type StoredJob,
 } from "@/lib/storage";
-import { clientUrlError, looksLikeUrl, parseUrlList } from "@/lib/urls";
+import {
+  clientUrlError,
+  looksLikeUrl,
+  parseUrlList,
+  platformHintForInput,
+} from "@/lib/urls";
 
 type Phase = "idle" | "previewing" | "ready" | "starting";
 
@@ -93,8 +98,9 @@ export function DownloaderApp() {
   captchaTokenRef.current = captchaToken;
   phaseRef.current = phase;
 
-  const maxSelect = preview?.max_playlist_select ?? 10;
   const isPlaylist = preview?.kind === "playlist";
+  const canSelectAll =
+    !!preview?.entries.length && selected.size >= preview.entries.length;
   const needsCaptcha = captchaEnabled();
   const busy = phase === "previewing" || phase === "starting";
 
@@ -242,7 +248,7 @@ export function DownloaderApp() {
         setPreview(data);
 
         if (data.kind === "playlist" && data.entries.length) {
-          const initial = data.entries.slice(0, Math.min(3, maxSelect));
+          const initial = data.entries.slice(0, Math.min(3, data.entries.length));
           setSelected(new Set(initial.map((x) => x.id)));
         } else {
           setSelected(new Set());
@@ -265,7 +271,7 @@ export function DownloaderApp() {
         setCaptchaToken(null);
       }
     },
-    [applyQualityPreference, maxSelect, needsCaptcha],
+    [applyQualityPreference, needsCaptcha],
   );
 
   const scheduleAutoProcess = useCallback(
@@ -417,7 +423,7 @@ export function DownloaderApp() {
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
-      else if (next.size < maxSelect) next.add(id);
+      else next.add(id);
       return next;
     });
   };
@@ -437,7 +443,7 @@ export function DownloaderApp() {
     const audio = quality === "audio" ? audioFormat : "m4a";
     rememberPrefs(quality, audio);
     setPhase("starting");
-    setStatusHint("Starting download…");
+    setStatusHint(null);
 
     try {
       if (multiUrls.length > 1) {
@@ -591,6 +597,8 @@ export function DownloaderApp() {
       ? Boolean(preview) || multiUrls.length > 1
       : false;
 
+  const platformHint = useMemo(() => platformHintForInput(url), [url]);
+
   const activeCount = jobs.filter((j) => isActiveStatus(j.status)).length;
 
   return (
@@ -685,13 +693,15 @@ export function DownloaderApp() {
               className="btn btn--primary url-form__submit"
               disabled={busy}
             >
-              {phase === "previewing"
-                ? "Working…"
-                : phase === "starting"
-                  ? "Starting…"
-                  : "Go"}
+              {phase === "previewing" ? "Working…" : "Go"}
             </button>
           </div>
+
+          {platformHint && (
+            <p className="url-form__platform" role="status" aria-live="polite">
+              {platformHint}
+            </p>
+          )}
 
           {clipHint && !url && (
             <p className="form-hint form-hint--info">
@@ -717,7 +727,7 @@ export function DownloaderApp() {
             </p>
           )}
 
-          {statusHint && !error && (
+          {statusHint && !error && phase !== "starting" && (
             <p className="form-hint form-hint--info" role="status">
               {statusHint}
             </p>
@@ -856,10 +866,11 @@ export function DownloaderApp() {
                   <div className="playlist">
                     <div className="playlist__toolbar">
                       <p>
-                        Select up to {maxSelect}{" "}
-                        <span className="muted">
-                          ({selected.size} selected)
-                        </span>
+                        {selected.size === 0
+                          ? "Select videos to download"
+                          : selected.size >= (preview.entries.length || 0)
+                            ? `All ${preview.entries.length} selected`
+                            : `${selected.size} of ${preview.entries.length} selected`}
                       </p>
                       <div className="playlist__actions">
                         <button
@@ -867,20 +878,18 @@ export function DownloaderApp() {
                           className="btn btn--ghost btn--small"
                           onClick={() =>
                             setSelected(
-                              new Set(
-                                preview.entries
-                                  .slice(0, maxSelect)
-                                  .map((e) => e.id),
-                              ),
+                              new Set(preview.entries.map((e) => e.id)),
                             )
                           }
+                          disabled={canSelectAll}
                         >
-                          Select max
+                          Select all
                         </button>
                         <button
                           type="button"
                           className="btn btn--ghost btn--small"
                           onClick={() => setSelected(new Set())}
+                          disabled={selected.size === 0}
                         >
                           Clear
                         </button>
@@ -889,17 +898,14 @@ export function DownloaderApp() {
                     <ul className="playlist__list">
                       {preview.entries.map((entry) => {
                         const checked = selected.has(entry.id);
-                        const disabled =
-                          !checked && selected.size >= maxSelect;
                         return (
                           <li key={entry.id}>
                             <label
-                              className={`playlist__item${checked ? " is-active" : ""}${disabled ? " is-disabled" : ""}`}
+                              className={`playlist__item${checked ? " is-active" : ""}`}
                             >
                               <input
                                 type="checkbox"
                                 checked={checked}
-                                disabled={disabled}
                                 onChange={() => toggleEntry(entry.id)}
                               />
                               {entry.thumbnail ? (

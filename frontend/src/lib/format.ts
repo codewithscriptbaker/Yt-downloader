@@ -57,8 +57,9 @@ export function downloadButtonLabel(opts: {
   fileSizeMb?: number | null;
   quality?: string | null;
   audioFormat?: string | null;
+  prefix?: string;
 }): string {
-  const parts: string[] = ["Download"];
+  const parts: string[] = [opts.prefix || "Download"];
   const ext =
     opts.fileName?.split(".").pop()?.toUpperCase() ||
     (opts.quality === "audio"

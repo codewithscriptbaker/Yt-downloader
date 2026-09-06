@@ -9,6 +9,8 @@ import type {
   HealthResponse,
   JobStatusResponse,
   PreviewResponse,
+  TrimJobResponse,
+  WaveformResponse,
 } from "./types";
 
 export class ApiError extends Error {
@@ -176,6 +178,147 @@ export async function getDownloadLink(jobId: string): Promise<DownloadResponse> 
   return request<DownloadResponse>(
     `/api/jobs/${encodeURIComponent(jobId)}/download`,
   );
+}
+
+export async function trimJobMedia(
+  jobId: string,
+  opts: { startSeconds: number; endSeconds: number; precise?: boolean },
+): Promise<TrimJobResponse> {
+  return request<TrimJobResponse>(
+    `/api/jobs/${encodeURIComponent(jobId)}/trim`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        start_seconds: opts.startSeconds,
+        end_seconds: opts.endSeconds,
+        precise: Boolean(opts.precise),
+      }),
+    },
+  );
+}
+
+/** @deprecated Prefer trimJobMedia */
+export const trimJobAudio = trimJobMedia;
+
+export async function composeJobMedia(
+  jobId: string,
+  opts: {
+    ranges: { startSeconds: number; endSeconds: number }[];
+    precise?: boolean;
+  },
+): Promise<TrimJobResponse> {
+  return request<TrimJobResponse>(
+    `/api/jobs/${encodeURIComponent(jobId)}/edit/compose`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        ranges: opts.ranges.map((r) => ({
+          start_seconds: r.startSeconds,
+          end_seconds: r.endSeconds,
+        })),
+        precise: Boolean(opts.precise),
+      }),
+    },
+  );
+}
+
+export async function insertJobMedia(
+  jobId: string,
+  opts: {
+    file: File;
+    atSeconds: number;
+    replaceAudio?: boolean;
+    crossfadeSeconds?: number;
+  },
+): Promise<TrimJobResponse> {
+  const form = new FormData();
+  form.append("file", opts.file);
+  form.append("at_seconds", String(opts.atSeconds));
+  form.append("replace_audio", opts.replaceAudio ? "true" : "false");
+  form.append("crossfade_seconds", String(opts.crossfadeSeconds ?? 0));
+
+  const url = `${getApiBase()}/api/jobs/${encodeURIComponent(jobId)}/edit/insert`;
+  const headers: Record<string, string> = { Accept: "application/json" };
+  const token = loadToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  let res: Response;
+  try {
+    res = await fetch(url, { method: "POST", headers, body: form });
+  } catch {
+    throw new ApiError("Cannot reach the API. Is the backend running?", 0);
+  }
+
+  const text = await res.text();
+  let body: TrimJobResponse | ApiErrorBody | null = null;
+  if (text) {
+    try {
+      body = JSON.parse(text) as TrimJobResponse;
+    } catch {
+      body = null;
+    }
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      detailMessage(body as ApiErrorBody | null, res.statusText || "Insert failed"),
+      res.status,
+    );
+  }
+  return body as TrimJobResponse;
+}
+
+export async function restoreJobMedia(jobId: string): Promise<TrimJobResponse> {
+  return request<TrimJobResponse>(
+    `/api/jobs/${encodeURIComponent(jobId)}/edit/restore`,
+    { method: "POST" },
+  );
+}
+
+export async function undoJobMedia(jobId: string): Promise<TrimJobResponse> {
+  return request<TrimJobResponse>(
+    `/api/jobs/${encodeURIComponent(jobId)}/edit/undo`,
+    { method: "POST" },
+  );
+}
+
+export async function cancelJobEdit(jobId: string): Promise<void> {
+  await request<void>(`/api/jobs/${encodeURIComponent(jobId)}/edit/cancel`, {
+    method: "POST",
+  });
+}
+
+/** Fetch server-built waveform peaks (absolute signed waveform URL). */
+export async function fetchWaveform(
+  absoluteWaveformUrl: string,
+  signal?: AbortSignal,
+): Promise<WaveformResponse> {
+  let res: Response;
+  try {
+    res = await fetch(absoluteWaveformUrl, {
+      signal,
+      mode: "cors",
+      credentials: "omit",
+      headers: { Accept: "application/json" },
+    });
+  } catch {
+    throw new ApiError("Cannot reach the API. Is the backend running?", 0);
+  }
+  const text = await res.text();
+  let body: WaveformResponse | ApiErrorBody | null = null;
+  if (text) {
+    try {
+      body = JSON.parse(text) as WaveformResponse;
+    } catch {
+      body = null;
+    }
+  }
+  if (!res.ok) {
+    throw new ApiError(
+      detailMessage(body as ApiErrorBody | null, res.statusText || "Waveform failed"),
+      res.status,
+    );
+  }
+  return body as WaveformResponse;
 }
 
 export async function cancelJob(jobId: string): Promise<void> {

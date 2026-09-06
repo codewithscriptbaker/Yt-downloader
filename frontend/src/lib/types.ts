@@ -53,17 +53,52 @@ export interface JobStatusResponse {
   error_hint: string | null;
   message: string | null;
   download_url: string | null;
+  original_download_url?: string | null;
   expires_at: number | null;
   quality: string | null;
   audio_format: string | null;
   file_name?: string | null;
   file_size_mb?: number | null;
+  original_file_size_mb?: number | null;
+  has_trim?: boolean;
+  has_previous_edit?: boolean;
   queue_position?: number | null;
 }
 
 export interface DownloadResponse {
   download_url: string;
   expires_in: number;
+}
+
+export interface TrimJobResponse {
+  job_id: string;
+  download_url: string;
+  original_download_url?: string | null;
+  expires_in: number;
+  expires_at: number;
+  file_size_mb: number;
+  original_file_size_mb?: number | null;
+  duration_seconds: number;
+  kind?: "audio" | "video";
+  has_trim?: boolean;
+  has_previous_edit?: boolean;
+  operation?: string | null;
+}
+
+export type EditJobResponse = TrimJobResponse;
+
+export interface EditTimeRange {
+  startSeconds: number;
+  endSeconds: number;
+}
+
+export interface WaveformResponse {
+  duration_seconds: number;
+  peaks: number[];
+  has_video: boolean;
+  has_audio: boolean;
+  kind: "audio" | "video";
+  bar_count: number;
 }
 
 export interface CreateJobResponse {

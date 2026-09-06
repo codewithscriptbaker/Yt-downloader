@@ -15,6 +15,7 @@ export type TrackedJob = JobStatusResponse & {
   title?: string | null;
   thumbnail?: string | null;
   absolute_download_url?: string | null;
+  absolute_original_download_url?: string | null;
   source_url?: string | null;
   estimated_size_mb?: number | null;
 };
@@ -26,25 +27,33 @@ type WsPayload = Partial<JobStatusResponse> & {
 
 async function withDownloadLink(job: TrackedJob): Promise<TrackedJob> {
   if (job.status !== "done") {
-    return { ...job, absolute_download_url: null };
+    return {
+      ...job,
+      absolute_download_url: null,
+      absolute_original_download_url: null,
+    };
   }
   try {
     let downloadUrl = job.download_url;
     let merged = job;
-    if (!downloadUrl) {
+    if (!downloadUrl || (job.has_trim && !job.original_download_url)) {
       const fresh = await getJob(job.job_id);
-      downloadUrl = fresh.download_url;
+      downloadUrl = fresh.download_url ?? downloadUrl;
       merged = { ...merged, ...fresh };
     }
     if (!downloadUrl) {
       const link = await getDownloadLink(job.job_id);
       downloadUrl = link.download_url;
     }
+    const originalUrl = merged.original_download_url ?? null;
     return {
       ...merged,
       download_url: downloadUrl,
       absolute_download_url: downloadUrl
         ? absoluteDownloadUrl(downloadUrl)
+        : null,
+      absolute_original_download_url: originalUrl
+        ? absoluteDownloadUrl(originalUrl)
         : null,
     };
   } catch {
@@ -52,6 +61,9 @@ async function withDownloadLink(job: TrackedJob): Promise<TrackedJob> {
       ...job,
       absolute_download_url: job.download_url
         ? absoluteDownloadUrl(job.download_url)
+        : null,
+      absolute_original_download_url: job.original_download_url
+        ? absoluteDownloadUrl(job.original_download_url)
         : null,
     };
   }
@@ -116,7 +128,20 @@ export function useJobTracker(initial: TrackedJob) {
             stopWatching();
             return;
           }
-          setJob((prev) => ({ ...prev, ...fresh }));
+          setJob((prev) => {
+            const incoming = fresh.progress;
+            let progress = incoming;
+            if (
+              isActiveStatus(fresh.status) &&
+              isActiveStatus(prev.status) &&
+              typeof incoming === "number" &&
+              typeof prev.progress === "number"
+            ) {
+              const retryReset = incoming <= 2 && prev.progress >= 15;
+              progress = retryReset ? incoming : Math.max(prev.progress, incoming);
+            }
+            return { ...prev, ...fresh, progress };
+          });
           if (!isActiveStatus(fresh.status)) stopWatching();
         } catch {
           /* keep trying */
@@ -183,17 +208,35 @@ export function useJobTracker(initial: TrackedJob) {
         return;
       }
 
-      setJob((prev) => ({
-        ...prev,
-        status: data.status as JobStatus,
-        progress: data.progress ?? prev.progress,
-        error: data.error ?? null,
-        error_hint: data.error_hint ?? null,
-        message: data.message ?? prev.message,
-        expires_at: data.expires_at ?? prev.expires_at,
-        quality: data.quality ?? prev.quality,
-        audio_format: data.audio_format ?? prev.audio_format,
-      }));
+      setJob((prev) => {
+        const nextStatus = data.status as JobStatus;
+        const incoming =
+          typeof data.progress === "number" ? data.progress : prev.progress;
+        // Never let the bar jump backwards while still downloading/processing.
+        // (Server is monotonic too; this guards against out-of-order WS/poll.)
+        let progress = incoming;
+        if (
+          isActiveStatus(nextStatus) &&
+          isActiveStatus(prev.status) &&
+          typeof incoming === "number" &&
+          typeof prev.progress === "number"
+        ) {
+          // Allow a real restart only when server resets near zero after a retry
+          const retryReset = incoming <= 2 && prev.progress >= 15;
+          progress = retryReset ? incoming : Math.max(prev.progress, incoming);
+        }
+        return {
+          ...prev,
+          status: nextStatus,
+          progress,
+          error: data.error ?? null,
+          error_hint: data.error_hint ?? null,
+          message: data.message ?? prev.message,
+          expires_at: data.expires_at ?? prev.expires_at,
+          quality: data.quality ?? prev.quality,
+          audio_format: data.audio_format ?? prev.audio_format,
+        };
+      });
 
       if (!isActiveStatus(data.status as JobStatus)) stopWatching();
     };
@@ -241,5 +284,5 @@ export function useJobTracker(initial: TrackedJob) {
     }
   }, [jobId, stopWatching]);
 
-  return { job, cancelling, cancelError, cancel };
+  return { job, setJob, cancelling, cancelError, cancel };
 }

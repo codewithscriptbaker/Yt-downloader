@@ -20,9 +20,9 @@ class Settings(BaseSettings):
     file_ttl_seconds: int = 3600
     max_jobs_per_ip: int = 2
     max_jobs_per_ip_per_hour: int = 10
-    # Playlist preview/download caps (public anonymous downloader)
-    max_playlist_entries: int = 30
-    max_playlist_select: int = 5
+    # Playlist preview: how many entries to list; select can include all of them
+    max_playlist_entries: int = 500
+    max_playlist_select: int = 500
     allowed_domains: str = (
         "youtube.com,www.youtube.com,m.youtube.com,youtu.be,music.youtube.com,"
         "tiktok.com,www.tiktok.com,vm.tiktok.com,"

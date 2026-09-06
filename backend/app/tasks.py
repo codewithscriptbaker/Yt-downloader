@@ -87,8 +87,84 @@ def _retry_sleep(backoff: float, attempt: int) -> None:
     time.sleep(delay)
 
 
-def _progress_hook(job_id: str, start_time: float, timeout: int):
+def _progress_hook(
+    job_id: str,
+    start_time: float,
+    timeout: int,
+    *,
+    expect_merge: bool = True,
+):
+    """
+    Smooth yt-dlp progress for single- and multi-stream downloads.
+
+    YouTube/DASH often downloads video then audio as separate files. Each file
+    reports 0–100% on its own, which made the UI jump to ~80% then snap back.
+    We map files into phases and never decrease progress within one attempt.
+    """
     settings = get_settings()
+    # Mutable attempt state (one hook instance per ydl run)
+    state: dict = {
+        "last": 0,
+        "files_done": 0,
+        "current_file": None,
+        # video+audio merge → 2 files; audio-only / progressive → 1
+        "expected_files": 2 if expect_merge else 1,
+        "last_publish": 0.0,
+    }
+    download_span = 92  # leave 92–99 for merge / finalize
+
+    def _file_fraction(d: dict) -> float:
+        total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+        downloaded = d.get("downloaded_bytes") or 0
+        if total and total > 0:
+            return max(0.0, min(1.0, float(downloaded) / float(total)))
+        # HLS / DASH fragments when byte totals are missing
+        frag_i = d.get("fragment_index")
+        frag_c = d.get("fragment_count")
+        if frag_c and frag_i is not None:
+            try:
+                return max(0.0, min(1.0, float(frag_i) / float(frag_c)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                return 0.0
+        return 0.0
+
+    def _map_progress(file_frac: float) -> int:
+        n = max(1, int(state["expected_files"]))
+        done = min(int(state["files_done"]), n - 1)
+        per = download_span / n
+        raw = done * per + file_frac * per
+        return int(max(0, min(download_span - 1, raw)))
+
+    def _publish(progress: int, *, status: JobStatus, message: str, force: bool = False) -> None:
+        progress = max(0, min(99, progress))
+        # Monotonic within this download attempt
+        if progress < state["last"] and not force:
+            progress = state["last"]
+        now = time.time()
+        # Throttle Redis/WS spam unless we moved ≥1% or it's a stage change
+        if (
+            not force
+            and progress == state["last"]
+            and (now - state["last_publish"]) < 0.45
+        ):
+            return
+        if (
+            not force
+            and progress > state["last"]
+            and progress - state["last"] < 1
+            and (now - state["last_publish"]) < 0.35
+        ):
+            return
+        state["last"] = progress
+        state["last_publish"] = now
+        update_job_fields(
+            job_id,
+            settings.file_ttl_seconds,
+            status=status,
+            progress=progress,
+            message=message,
+            error=None,
+        )
 
     def hook(d: dict) -> None:
         if time.time() - start_time > timeout:
@@ -98,28 +174,59 @@ def _progress_hook(job_id: str, start_time: float, timeout: int):
         if job and job.status == JobStatus.CANCELLED:
             raise JobCancelled("Job cancelled by user")
 
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes") or 0
-            progress = int(downloaded * 100 / total) if total else 0
-            progress = max(0, min(progress, 99))
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.DOWNLOADING,
-                progress=progress,
-                message="Downloading media…",
-                error=None,
+        status = d.get("status")
+        if status == "downloading":
+            filename = d.get("filename") or ""
+            # New stream started (e.g. audio after video) without relying only on "finished"
+            if (
+                filename
+                and state["current_file"]
+                and filename != state["current_file"]
+            ):
+                # Adaptive: progressive guess was wrong — we actually have 2+ parts
+                if state["expected_files"] < 2:
+                    state["expected_files"] = 2
+                state["files_done"] = min(
+                    state["files_done"] + 1,
+                    max(0, state["expected_files"] - 1),
+                )
+            if filename:
+                state["current_file"] = filename
+
+            frac = _file_fraction(d)
+            progress = _map_progress(frac)
+            n = max(1, int(state["expected_files"]))
+            if n > 1 and state["files_done"] == 0:
+                msg = "Downloading video…"
+            elif n > 1 and state["files_done"] >= 1:
+                msg = "Downloading audio…"
+            else:
+                msg = "Downloading media…"
+            _publish(progress, status=JobStatus.DOWNLOADING, message=msg)
+
+        elif status == "finished":
+            # One part done (video or audio) — do NOT jump to 99% yet if more parts remain
+            state["files_done"] = min(
+                state["files_done"] + 1,
+                int(state["expected_files"]),
             )
-        elif d.get("status") == "finished":
-            update_job_fields(
-                job_id,
-                settings.file_ttl_seconds,
-                status=JobStatus.PROCESSING,
-                progress=99,
-                message="Finalizing file…",
-                error=None,
-            )
+            state["current_file"] = None
+            if state["files_done"] >= state["expected_files"]:
+                _publish(
+                    96,
+                    status=JobStatus.PROCESSING,
+                    message="Finalizing file…",
+                    force=True,
+                )
+            else:
+                # Land at the start of the next phase (smooth handoff)
+                progress = _map_progress(0.0)
+                _publish(
+                    max(progress, state["last"]),
+                    status=JobStatus.DOWNLOADING,
+                    message="Downloading audio…" if expect_merge else "Downloading media…",
+                    force=True,
+                )
 
     return hook
 
@@ -161,6 +268,8 @@ def _build_ydl_opts(
         quality=q, url=url, is_tiktok=tiktok, is_facebook=facebook
     )
     audio_only = is_audio_quality(q)
+    # Separate A/V streams need merge — except progressive-first sites often get one file
+    expect_merge = (not audio_only) and (not tiktok) and (not facebook)
 
     ydl_opts: dict = {
         "outtmpl": str(tmp_dir / "%(title).80B [%(id)s].%(ext)s"),
@@ -168,7 +277,14 @@ def _build_ydl_opts(
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "progress_hooks": [_progress_hook(job_id, start, settings.job_timeout_seconds)],
+        "progress_hooks": [
+            _progress_hook(
+                job_id,
+                start,
+                settings.job_timeout_seconds,
+                expect_merge=expect_merge,
+            )
+        ],
         "socket_timeout": socket_timeout,
         "retries": 10 if extra_retries else 3,
         "fragment_retries": 10 if extra_retries else 3,
@@ -376,13 +492,24 @@ def download_media(self, job_id: str, url: str) -> dict:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return {"job_id": job_id, "status": "cancelled"}
 
-            _set_stage(
-                job_id,
-                settings,
-                status=JobStatus.DOWNLOADING,
-                progress=0,
-                message="Downloading…",
-            )
+            # Reset progress only at the start of a strategy attempt — not on every
+            # silent network retry (that caused the bar to jump back mid-download).
+            if net_try == 1:
+                _set_stage(
+                    job_id,
+                    settings,
+                    status=JobStatus.DOWNLOADING,
+                    progress=0,
+                    message="Downloading…",
+                )
+            else:
+                update_job_fields(
+                    job_id,
+                    settings.file_ttl_seconds,
+                    status=JobStatus.DOWNLOADING,
+                    message="Downloading…",
+                    error=None,
+                )
 
             try:
                 ensure_host_reachable(url)
@@ -600,6 +727,12 @@ def cleanup_expired() -> dict:
         if expired:
             if job.file_path:
                 storage.delete_path(job.file_path)
+                deleted_files += 1
+            if getattr(job, "original_file_path", None):
+                storage.delete_path(job.original_file_path)
+                deleted_files += 1
+            if getattr(job, "previous_file_path", None):
+                storage.delete_path(job.previous_file_path)
                 deleted_files += 1
             # Also clean tmp if present
             tmp = storage.tmp / job_id
